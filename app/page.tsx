@@ -24,9 +24,10 @@ import {
   Plus,
   Pin,
   Smile,
-  Menu,
   X,
-  FileBox
+  FileBox,
+  Zap,
+  Trash2
 } from 'lucide-react';
 
 interface NoteDoc {
@@ -43,7 +44,7 @@ interface Message {
   message: string;
   created_at: string;
   is_pinned?: boolean;
-  reactions?: Record<string, string[]>; // e.g. { "❤️": ["Sanjeev", "Alex"] }
+  reactions?: Record<string, string[]>;
 }
 
 interface OnlineUser {
@@ -74,9 +75,8 @@ export default function Workspace() {
   const [isNameSet, setIsNameSet] = useState<boolean>(false);
   const [connectionStatus, setConnectionStatus] = useState<'CONNECTING' | 'SUBSCRIBED' | 'ERROR'>('CONNECTING');
 
-  // Mobile Views: 'notes' | 'chat' | 'docs'
-  const [mobileTab, setMobileTab] = useState<'notes' | 'chat' | 'docs'>('notes');
-  const [isSidebarOpen, setIsSidebarOpen] = useState<boolean>(false);
+  // Active view for mobile screens
+  const [activeTab, setActiveTab] = useState<'docs' | 'notes' | 'chat'>('notes');
 
   // Multi-Document State
   const [docs, setDocs] = useState<NoteDoc[]>([]);
@@ -103,13 +103,16 @@ export default function Workspace() {
 
   const chatBottomRef = useRef<HTMLDivElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
-  const isTypingLocally = useRef<boolean>(false);
-  const debounceTimer = useRef<NodeJS.Timeout | null>(null);
-  const channelRef = useRef<ReturnType<typeof supabase.channel> | null>(null);
-  const chatTypingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
-  const noteTypingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
-  // Load Saved Username
+  const channelRef = useRef<ReturnType<typeof supabase.channel> | null>(null);
+  const dbSaveTimer = useRef<NodeJS.Timeout | null>(null);
+  const chatTypingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const activeDocIdRef = useRef(activeDocId);
+
+  useEffect(() => {
+    activeDocIdRef.current = activeDocId;
+  }, [activeDocId]);
+
   useEffect(() => {
     const savedName = localStorage.getItem('collab_username');
     if (savedName) {
@@ -125,7 +128,6 @@ export default function Workspace() {
     setIsNameSet(true);
   };
 
-  // 1. Initial Data Fetch & Realtime Listeners
   useEffect(() => {
     if (!isNameSet || !username) return;
 
@@ -160,31 +162,39 @@ export default function Workspace() {
     fetchDocuments();
     fetchMessages();
 
-    // Multiplexed Realtime Channel
     const channel = supabase.channel('collab_global_workspace', {
-      config: { presence: { key: username } },
+      config: {
+        presence: { key: username },
+        broadcast: { ack: false },
+      },
     });
 
     channelRef.current = channel;
 
     channel
-      // Notes updates & inserts
+      .on('broadcast', { event: 'instant_text_edit' }, ({ payload }) => {
+        if (payload.docId === activeDocIdRef.current && payload.user !== username) {
+          setNoteContent(payload.content);
+          setLastEditedBy(payload.user);
+
+          setNoteTypingUsers((prev) => Array.from(new Set([...prev, payload.user])));
+          setTimeout(() => {
+            setNoteTypingUsers((prev) => prev.filter((u) => u !== payload.user));
+          }, 1500);
+        }
+      })
       .on('postgres_changes', { event: '*', schema: 'public', table: 'shared_notes' }, (payload) => {
         if (payload.eventType === 'INSERT') {
           setDocs((prev) => [payload.new as NoteDoc, ...prev]);
         } else if (payload.eventType === 'UPDATE') {
           const updated = payload.new as NoteDoc;
           setDocs((prev) => prev.map((d) => (d.id === updated.id ? updated : d)));
-          if (updated.id === activeDocId) {
-            if (!isTypingLocally.current) {
-              setNoteContent(updated.content || '');
-            }
+          if (updated.id === activeDocIdRef.current && updated.updated_by !== username) {
             setNoteTitle(updated.title || 'Untitled');
             setLastEditedBy(updated.updated_by || 'Someone');
           }
         }
       })
-      // Chat messages changes (insert & update for reactions/pins)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'chat_messages' }, (payload) => {
         if (payload.eventType === 'INSERT') {
           setMessages((prev) => {
@@ -194,9 +204,11 @@ export default function Workspace() {
         } else if (payload.eventType === 'UPDATE') {
           const updated = payload.new as Message;
           setMessages((prev) => prev.map((m) => (m.id === updated.id ? updated : m)));
+        } else if (payload.eventType === 'DELETE') {
+          const deletedId = (payload.old as { id: string }).id;
+          setMessages((prev) => prev.filter((m) => m.id !== deletedId));
         }
       })
-      // Presence
       .on('presence', { event: 'sync' }, () => {
         const state = channel.presenceState();
         const active: OnlineUser[] = [];
@@ -206,17 +218,10 @@ export default function Workspace() {
         });
         setOnlineUsers(active);
       })
-      // Broadcasts
       .on('broadcast', { event: 'chat_typing' }, ({ payload }) => {
         if (payload.user && payload.user !== username) {
           setChatTypingUsers((prev) => Array.from(new Set([...prev, payload.user])));
           setTimeout(() => setChatTypingUsers((prev) => prev.filter((u) => u !== payload.user)), 2000);
-        }
-      })
-      .on('broadcast', { event: 'note_typing' }, ({ payload }) => {
-        if (payload.user && payload.user !== username && payload.docId === activeDocId) {
-          setNoteTypingUsers((prev) => Array.from(new Set([...prev, payload.user])));
-          setTimeout(() => setNoteTypingUsers((prev) => prev.filter((u) => u !== payload.user)), 2000);
         }
       })
       .subscribe(async (status) => {
@@ -231,24 +236,21 @@ export default function Workspace() {
     return () => {
       supabase.removeChannel(channel);
     };
-  }, [isNameSet, username, activeDocId]);
+  }, [isNameSet, username]);
 
-  // Auto-scroll chat
   useEffect(() => {
     chatBottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, chatTypingUsers]);
 
-  // Switch Active Document
   const handleSelectDoc = (doc: NoteDoc) => {
     setActiveDocId(doc.id);
+    activeDocIdRef.current = doc.id;
     setNoteTitle(doc.title);
     setNoteContent(doc.content || '');
     setLastEditedBy(doc.updated_by || 'System');
-    setIsSidebarOpen(false);
-    setMobileTab('notes');
+    setActiveTab('notes');
   };
 
-  // Create New Document
   const handleCreateDocument = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newDocTitle.trim()) return;
@@ -258,7 +260,7 @@ export default function Workspace() {
       .insert([
         {
           title: newDocTitle.trim(),
-          content: `# ${newDocTitle.trim()}\n\nStart typing your document...`,
+          content: `# ${newDocTitle.trim()}\n\nStart typing...`,
           updated_by: username,
         },
       ])
@@ -272,43 +274,39 @@ export default function Workspace() {
     }
   };
 
-  // Sync Note Content
   const handleContentChange = (val: string) => {
     setNoteContent(val);
-    isTypingLocally.current = true;
-    setIsSaving(true);
+    setLastEditedBy(username);
 
     if (channelRef.current) {
-      if (!noteTypingTimeoutRef.current) {
-        channelRef.current.send({
-          type: 'broadcast',
-          event: 'note_typing',
-          payload: { user: username, docId: activeDocId },
-        });
-        noteTypingTimeoutRef.current = setTimeout(() => {
-          noteTypingTimeoutRef.current = null;
-        }, 1200);
-      }
+      channelRef.current.send({
+        type: 'broadcast',
+        event: 'instant_text_edit',
+        payload: {
+          docId: activeDocId,
+          user: username,
+          content: val,
+        },
+      });
     }
 
-    if (debounceTimer.current) clearTimeout(debounceTimer.current);
+    setIsSaving(true);
+    if (dbSaveTimer.current) clearTimeout(dbSaveTimer.current);
 
-    debounceTimer.current = setTimeout(async () => {
+    dbSaveTimer.current = setTimeout(async () => {
       await supabase
         .from('shared_notes')
         .update({
           content: val,
-          updated_by: username || 'Guest',
+          updated_by: username,
           updated_at: new Date().toISOString(),
         })
         .eq('id', activeDocId);
 
       setIsSaving(false);
-      isTypingLocally.current = false;
-    }, 400);
+    }, 800);
   };
 
-  // Chat typing broadcast
   const handleChatInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     setNewMessage(e.target.value);
     if (channelRef.current && e.target.value.trim().length > 0) {
@@ -325,7 +323,6 @@ export default function Workspace() {
     }
   };
 
-  // Formatting helpers
   const insertFormatting = (prefix: string, suffix: string = '') => {
     const textarea = textareaRef.current;
     if (!textarea) return;
@@ -343,7 +340,6 @@ export default function Workspace() {
     }, 50);
   };
 
-  // Export note
   const handleExportNote = () => {
     const blob = new Blob([noteContent], { type: 'text/markdown;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
@@ -355,7 +351,6 @@ export default function Workspace() {
     document.body.removeChild(link);
   };
 
-  // Send Chat Message
   const handleSendMessage = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newMessage.trim()) return;
@@ -371,7 +366,6 @@ export default function Workspace() {
     ]);
   };
 
-  // Toggle Message Reaction
   const handleToggleReaction = async (messageId: string, emoji: string) => {
     const msg = messages.find((m) => m.id === messageId);
     if (!msg) return;
@@ -394,12 +388,25 @@ export default function Workspace() {
       .eq('id', messageId);
   };
 
-  // Toggle Pinned Message
   const handleTogglePin = async (messageId: string, currentPinStatus: boolean) => {
     await supabase
       .from('chat_messages')
       .update({ is_pinned: !currentPinStatus })
       .eq('id', messageId);
+  };
+
+  const handleDeleteMessage = async (messageId: string) => {
+    setMessages((prev) => prev.filter((m) => m.id !== messageId));
+
+    const { error } = await supabase
+      .from('chat_messages')
+      .delete()
+      .eq('id', messageId);
+
+    if (error) {
+      console.error('Failed to delete message:', error);
+      alert('Could not delete message: ' + error.message);
+    }
   };
 
   const pinnedMessages = messages.filter((m) => m.is_pinned);
@@ -408,8 +415,8 @@ export default function Workspace() {
 
   if (!isNameSet) {
     return (
-      <div className="min-h-screen bg-[#09090b] flex items-center justify-center p-4 selection:bg-indigo-500 selection:text-white">
-        <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-8 max-w-md w-full shadow-2xl relative overflow-hidden">
+      <div className="h-[100dvh] w-screen bg-[#09090b] flex items-center justify-center p-4 selection:bg-indigo-500 selection:text-white">
+        <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-6 sm:p-8 max-w-md w-full shadow-2xl relative overflow-hidden">
           <div className="absolute -top-16 -right-16 w-36 h-36 bg-indigo-500/10 rounded-full blur-3xl pointer-events-none" />
           <div className="flex items-center gap-3 mb-3">
             <div className="p-2.5 bg-indigo-500/10 border border-indigo-500/20 rounded-xl text-indigo-400">
@@ -417,7 +424,7 @@ export default function Workspace() {
             </div>
             <div>
               <h1 className="text-lg font-semibold text-zinc-100">Welcome to CollabHub</h1>
-              <p className="text-xs text-zinc-400">Shared workspace with live docs & chat</p>
+              <p className="text-xs text-zinc-400">Zero-latency live docs & room chat</p>
             </div>
           </div>
           <form onSubmit={handleSaveUsername} className="space-y-4 mt-6">
@@ -445,95 +452,126 @@ export default function Workspace() {
   }
 
   return (
-    <div className="min-h-screen bg-[#09090b] text-zinc-100 flex flex-col font-sans selection:bg-indigo-500 selection:text-white overflow-hidden h-screen">
-      {/* Top Header */}
-      <header className="border-b border-zinc-800/80 bg-zinc-950/70 backdrop-blur-md px-4 sm:px-6 py-2.5 sm:py-3 flex items-center justify-between z-20 shrink-0">
-        <div className="flex items-center gap-3">
-          {/* Mobile Sidebar Toggle Button */}
-          <button
-            type="button"
-            onClick={() => setIsSidebarOpen(!isSidebarOpen)}
-            className="lg:hidden p-1.5 hover:bg-zinc-800 rounded-lg text-zinc-400 hover:text-zinc-200 transition"
-          >
-            {isSidebarOpen ? <X className="w-5 h-5" /> : <Menu className="w-5 h-5" />}
-          </button>
-
-          <div className="flex items-center gap-2">
-            <div className="h-2.5 w-2.5 rounded-full bg-indigo-500 shadow-[0_0_10px_#6366f1]" />
+    <div className="h-[100dvh] w-screen max-w-full bg-[#09090b] text-zinc-100 flex flex-col font-sans selection:bg-indigo-500 selection:text-white overflow-hidden">
+      {/* Top Header Bar */}
+      <header className="border-b border-zinc-800/80 bg-zinc-950/80 backdrop-blur-md px-3 sm:px-6 py-2 sm:py-2.5 flex items-center justify-between shrink-0 z-20">
+        <div className="flex items-center gap-2 sm:gap-3">
+          <div className="flex items-center gap-1.5">
+            <div className="h-2.5 w-2.5 rounded-full bg-indigo-500 shadow-[0_0_8px_#6366f1]" />
             <h1 className="font-semibold text-sm sm:text-base tracking-tight text-zinc-100">CollabHub</h1>
           </div>
 
-          <div className="hidden md:flex items-center pl-2">
+          <div className="hidden lg:flex items-center gap-1.5 pl-1">
             {connectionStatus === 'SUBSCRIBED' && (
-              <span className="flex items-center gap-1.5 text-[11px] text-emerald-400 bg-emerald-950/40 border border-emerald-800/40 px-2 py-0.5 rounded-md">
-                <CheckCircle2 className="w-3 h-3" /> Live
-              </span>
+              <>
+                <span className="flex items-center gap-1 text-[11px] text-emerald-400 bg-emerald-950/40 border border-emerald-800/40 px-2 py-0.5 rounded-md">
+                  <CheckCircle2 className="w-3 h-3" /> Live
+                </span>
+                <span className="flex items-center gap-1 text-[11px] text-cyan-400 bg-cyan-950/40 border border-cyan-800/40 px-2 py-0.5 rounded-md">
+                  <Zap className="w-3 h-3" /> Zero Latency
+                </span>
+              </>
             )}
             {connectionStatus === 'CONNECTING' && (
-              <span className="flex items-center gap-1.5 text-[11px] text-amber-400 bg-amber-950/40 border border-amber-800/40 px-2 py-0.5 rounded-md animate-pulse">
+              <span className="flex items-center gap-1 text-[11px] text-amber-400 bg-amber-950/40 border border-amber-800/40 px-2 py-0.5 rounded-md animate-pulse">
                 Syncing...
               </span>
             )}
           </div>
         </div>
 
-        {/* Presence Avatars & Current User */}
+        {/* Mobile View Toggles on Top Bar */}
+        <div className="flex lg:hidden items-center bg-zinc-900 border border-zinc-800 rounded-lg p-0.5">
+          <button
+            type="button"
+            onClick={() => setActiveTab('docs')}
+            className={`flex items-center gap-1 px-2.5 py-1 text-xs font-medium rounded-md transition ${
+              activeTab === 'docs'
+                ? 'bg-indigo-600 text-white shadow-sm'
+                : 'text-zinc-400 hover:text-zinc-200'
+            }`}
+          >
+            <FileBox className="w-3.5 h-3.5" />
+            <span>Docs</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => setActiveTab('notes')}
+            className={`flex items-center gap-1 px-2.5 py-1 text-xs font-medium rounded-md transition ${
+              activeTab === 'notes'
+                ? 'bg-indigo-600 text-white shadow-sm'
+                : 'text-zinc-400 hover:text-zinc-200'
+            }`}
+          >
+            <Edit3 className="w-3.5 h-3.5" />
+            <span>Notes</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => setActiveTab('chat')}
+            className={`flex items-center gap-1 px-2.5 py-1 text-xs font-medium rounded-md relative transition ${
+              activeTab === 'chat'
+                ? 'bg-indigo-600 text-white shadow-sm'
+                : 'text-zinc-400 hover:text-zinc-200'
+            }`}
+          >
+            <MessageSquare className="w-3.5 h-3.5" />
+            <span>Chat</span>
+            {pinnedMessages.length > 0 && (
+              <span className="w-1.5 h-1.5 rounded-full bg-amber-400" />
+            )}
+          </button>
+        </div>
+
+        {/* Presence Avatars & Username */}
         <div className="flex items-center gap-2 sm:gap-3">
-          <div className="flex items-center -space-x-1.5 overflow-hidden">
-            {onlineUsers.slice(0, 4).map((u, i) => (
+          <div className="hidden sm:flex items-center -space-x-1.5 overflow-hidden">
+            {onlineUsers.slice(0, 3).map((u, i) => (
               <div
                 key={i}
                 title={`${u.user} is active now`}
-                className={`h-6 w-6 sm:h-7 sm:w-7 rounded-full border border-zinc-950 flex items-center justify-center text-[10px] font-bold uppercase shadow-sm ${getAvatarColor(
+                className={`h-6 w-6 rounded-full border border-zinc-950 flex items-center justify-center text-[10px] font-bold uppercase shadow-sm ${getAvatarColor(
                   u.user
                 )}`}
               >
                 {u.user.charAt(0)}
               </div>
             ))}
-            {onlineUsers.length > 4 && (
-              <div className="h-6 w-6 sm:h-7 sm:w-7 rounded-full bg-zinc-800 border border-zinc-950 flex items-center justify-center text-[10px] font-medium text-zinc-400">
-                +{onlineUsers.length - 4}
-              </div>
-            )}
           </div>
 
-          <div className={`flex items-center gap-1.5 sm:gap-2 px-2.5 py-1 rounded-lg border text-xs font-medium ${getAvatarColor(username)}`}>
-            <Users className="w-3 h-3 sm:w-3.5 sm:h-3.5" />
-            <span className="truncate max-w-[80px] sm:max-w-none">{username}</span>
+          <div className={`flex items-center gap-1.5 px-2 py-0.5 sm:px-2.5 sm:py-1 rounded-lg border text-xs font-medium ${getAvatarColor(username)}`}>
+            <Users className="w-3 h-3" />
+            <span className="truncate max-w-[70px] sm:max-w-none">{username}</span>
           </div>
         </div>
       </header>
 
-      {/* Workspace Body */}
-      <div className="flex-1 flex overflow-hidden relative">
-        {/* Left Sidebar: Multi-Document Drawer */}
+      {/* Main Workspace Body */}
+      <div className="flex-1 flex overflow-hidden w-full relative">
+        {/* Left Sidebar: Documents */}
         <aside
           className={`
-            fixed lg:static inset-y-0 left-0 z-30 lg:z-auto
-            w-64 bg-zinc-950 border-r border-zinc-800/80 flex flex-col shrink-0
-            transform transition-transform duration-200 ease-in-out
-            ${isSidebarOpen ? 'translate-x-0' : '-translate-x-full lg:translate-x-0'}
+            w-full lg:w-60 bg-zinc-950 border-r border-zinc-800/80 flex flex-col shrink-0
+            ${activeTab === 'docs' ? 'flex' : 'hidden lg:flex'}
           `}
         >
-          <div className="p-3.5 border-b border-zinc-800/80 flex items-center justify-between">
-            <div className="flex items-center gap-2 text-xs font-medium text-zinc-400">
+          <div className="p-3 border-b border-zinc-800/80 flex items-center justify-between shrink-0">
+            <div className="flex items-center gap-2 text-xs font-medium text-zinc-300">
               <FileBox className="w-4 h-4 text-indigo-400" />
-              <span>Workspace Documents</span>
+              <span>Documents ({docs.length})</span>
             </div>
             <button
               type="button"
               onClick={() => setIsCreatingDoc(!isCreatingDoc)}
               title="New Document"
-              className="p-1 hover:bg-zinc-800 text-zinc-400 hover:text-zinc-200 rounded-md transition"
+              className="p-1 hover:bg-zinc-800 text-zinc-400 hover:text-zinc-200 rounded-md transition cursor-pointer"
             >
               <Plus className="w-4 h-4" />
             </button>
           </div>
 
-          {/* New Document Input Modal */}
           {isCreatingDoc && (
-            <form onSubmit={handleCreateDocument} className="p-3 bg-zinc-900/60 border-b border-zinc-800 space-y-2">
+            <form onSubmit={handleCreateDocument} className="p-3 bg-zinc-900/60 border-b border-zinc-800 space-y-2 shrink-0">
               <input
                 type="text"
                 required
@@ -561,7 +599,6 @@ export default function Workspace() {
             </form>
           )}
 
-          {/* Documents List */}
           <div className="flex-1 overflow-y-auto p-2 space-y-1">
             {docs.map((doc) => {
               const isActive = doc.id === activeDocId;
@@ -569,102 +606,90 @@ export default function Workspace() {
                 <button
                   key={doc.id}
                   onClick={() => handleSelectDoc(doc)}
-                  className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-xs text-left transition ${
+                  className={`w-full flex items-center gap-2 px-3 py-2 rounded-lg text-xs text-left transition cursor-pointer ${
                     isActive
                       ? 'bg-indigo-600/20 text-indigo-300 font-medium border border-indigo-500/30'
                       : 'text-zinc-400 hover:bg-zinc-900/80 hover:text-zinc-200 border border-transparent'
                   }`}
                 >
-                  <FileText className="w-4 h-4 shrink-0 text-indigo-400/80" />
+                  <FileText className="w-3.5 h-3.5 shrink-0 text-indigo-400/80" />
                   <span className="truncate flex-1">{doc.title}</span>
                 </button>
               );
             })}
           </div>
-
-          <div className="p-3 border-t border-zinc-800/80 text-[11px] text-zinc-500">
-            {docs.length} document{docs.length === 1 ? '' : 's'} shared
-          </div>
         </aside>
 
-        {/* Backdrop for Mobile Sidebar */}
-        {isSidebarOpen && (
-          <div
-            onClick={() => setIsSidebarOpen(false)}
-            className="fixed inset-0 bg-black/60 backdrop-blur-sm z-20 lg:hidden"
-          />
-        )}
-
-        {/* Center Canvas: Note Workspace */}
+        {/* Center: Live Note Canvas */}
         <section
           className={`
-            flex-1 flex flex-col bg-zinc-950/30 overflow-hidden
-            ${mobileTab === 'notes' ? 'flex' : 'hidden lg:flex'}
+            flex-1 flex flex-col bg-zinc-950/30 overflow-hidden min-w-0
+            ${activeTab === 'notes' ? 'flex' : 'hidden lg:flex'}
           `}
         >
-          {/* Note Toolbar Header */}
-          <div className="flex flex-wrap items-center justify-between gap-2 px-3 sm:px-5 py-2 border-b border-zinc-800/80 bg-zinc-900/40">
-            <div className="flex items-center gap-1 text-zinc-400 overflow-x-auto py-0.5 max-w-full">
+          {/* Markdown Formatting & Quick Tools Bar */}
+          <div className="flex items-center justify-between gap-1.5 px-3 sm:px-4 py-1.5 sm:py-2 border-b border-zinc-800/80 bg-zinc-900/40 shrink-0">
+            <div className="flex items-center gap-0.5 text-zinc-400 overflow-x-auto py-0.5 max-w-full">
               <button
                 type="button"
                 onClick={() => insertFormatting('**', '**')}
                 title="Bold"
-                className="p-1.5 hover:bg-zinc-800 hover:text-zinc-200 rounded-md transition"
+                className="p-1.5 hover:bg-zinc-800 hover:text-zinc-200 rounded transition cursor-pointer"
               >
-                <Bold className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
+                <Bold className="w-3.5 h-3.5" />
               </button>
               <button
                 type="button"
                 onClick={() => insertFormatting('*', '*')}
                 title="Italic"
-                className="p-1.5 hover:bg-zinc-800 hover:text-zinc-200 rounded-md transition"
+                className="p-1.5 hover:bg-zinc-800 hover:text-zinc-200 rounded transition cursor-pointer"
               >
-                <Italic className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
+                <Italic className="w-3.5 h-3.5" />
               </button>
               <button
                 type="button"
                 onClick={() => insertFormatting('## ')}
                 title="Heading"
-                className="p-1.5 hover:bg-zinc-800 hover:text-zinc-200 rounded-md transition"
+                className="p-1.5 hover:bg-zinc-800 hover:text-zinc-200 rounded transition cursor-pointer"
               >
-                <Heading2 className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
+                <Heading2 className="w-3.5 h-3.5" />
               </button>
               <button
                 type="button"
                 onClick={() => insertFormatting('- ')}
-                title="Bullet List"
-                className="p-1.5 hover:bg-zinc-800 hover:text-zinc-200 rounded-md transition"
+                title="List"
+                className="p-1.5 hover:bg-zinc-800 hover:text-zinc-200 rounded transition cursor-pointer"
               >
-                <List className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
+                <List className="w-3.5 h-3.5" />
               </button>
               <button
                 type="button"
                 onClick={() => insertFormatting('- [ ] ')}
                 title="Checklist"
-                className="p-1.5 hover:bg-zinc-800 hover:text-zinc-200 rounded-md transition"
+                className="p-1.5 hover:bg-zinc-800 hover:text-zinc-200 rounded transition cursor-pointer"
               >
-                <CheckSquare className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
+                <CheckSquare className="w-3.5 h-3.5" />
               </button>
               <button
                 type="button"
                 onClick={() => insertFormatting('```\n', '\n```')}
                 title="Code Block"
-                className="p-1.5 hover:bg-zinc-800 hover:text-zinc-200 rounded-md transition"
+                className="p-1.5 hover:bg-zinc-800 hover:text-zinc-200 rounded transition cursor-pointer"
               >
-                <Code className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
+                <Code className="w-3.5 h-3.5" />
               </button>
             </div>
 
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-1.5 shrink-0">
               {noteTypingUsers.length > 0 && (
-                <span className="text-[10px] sm:text-[11px] text-indigo-400 bg-indigo-950/40 border border-indigo-800/40 px-2 py-0.5 rounded-md animate-pulse">
+                <span className="text-[10px] text-cyan-400 bg-cyan-950/40 border border-cyan-800/40 px-2 py-0.5 rounded-md animate-pulse hidden sm:inline">
                   {noteTypingUsers.join(', ')} typing...
                 </span>
               )}
               <button
                 type="button"
                 onClick={() => setPreviewMode(!previewMode)}
-                className={`flex items-center gap-1 px-2 py-1 text-xs rounded-lg border transition ${
+                className={`flex items-center gap-1 px-2 py-1 text-xs rounded-md border transition cursor-pointer ${
                   previewMode
                     ? 'bg-indigo-600/20 text-indigo-300 border-indigo-500/30'
                     : 'bg-zinc-800/60 text-zinc-400 border-zinc-700/60 hover:text-zinc-200'
@@ -677,7 +702,7 @@ export default function Workspace() {
                 type="button"
                 onClick={handleExportNote}
                 title="Download as Markdown"
-                className="flex items-center gap-1 px-2 py-1 text-xs text-zinc-400 hover:text-zinc-200 bg-zinc-800/60 hover:bg-zinc-800 border border-zinc-700/60 rounded-lg transition"
+                className="flex items-center gap-1 px-2 py-1 text-xs text-zinc-400 hover:text-zinc-200 bg-zinc-800/60 hover:bg-zinc-800 border border-zinc-700/60 rounded-md transition cursor-pointer"
               >
                 <Download className="w-3 h-3" />
                 <span className="hidden sm:inline">Export</span>
@@ -685,23 +710,23 @@ export default function Workspace() {
             </div>
           </div>
 
-          {/* Active Note Title Indicator */}
-          <div className="px-5 py-2 bg-zinc-900/20 border-b border-zinc-800/40 flex items-center justify-between text-xs text-zinc-400">
-            <span className="font-semibold text-zinc-200">{noteTitle}</span>
-            <div className="text-[11px] text-zinc-500">
+          {/* Subheader: Active Title & Save Status */}
+          <div className="px-4 py-1.5 bg-zinc-900/20 border-b border-zinc-800/40 flex items-center justify-between text-xs text-zinc-400 shrink-0">
+            <span className="font-semibold text-zinc-200 truncate pr-2">{noteTitle}</span>
+            <div className="text-[11px] text-zinc-500 shrink-0">
               {isSaving ? (
-                <span className="text-amber-400 animate-pulse">Syncing...</span>
+                <span className="text-amber-400 animate-pulse">Saving...</span>
               ) : (
                 <span>Edited by {lastEditedBy}</span>
               )}
             </div>
           </div>
 
-          {/* Canvas Editor vs Preview */}
-          <div className="flex-1 p-4 sm:p-6 overflow-y-auto">
+          {/* Editor Canvas Area */}
+          <div className="flex-1 p-3 sm:p-5 overflow-y-auto w-full">
             {previewMode ? (
               <div
-                className="prose prose-invert max-w-none text-zinc-300 leading-relaxed space-y-2 [&>h1]:text-2xl [&>h1]:font-bold [&>h2]:text-xl [&>h2]:font-semibold [&>ul]:list-disc [&>ul]:pl-5 [&>pre]:bg-zinc-900 [&>pre]:p-3 [&>pre]:rounded-lg"
+                className="prose prose-invert max-w-none text-zinc-300 leading-relaxed space-y-2 [&>h1]:text-2xl [&>h1]:font-bold [&>h2]:text-xl [&>h2]:font-semibold [&>ul]:list-disc [&>ul]:pl-5 [&>pre]:bg-zinc-900 [&>pre]:p-3 [&>pre]:rounded-lg text-sm sm:text-base"
                 dangerouslySetInnerHTML={{ __html: marked.parse(noteContent || '*No content to preview*') }}
               />
             ) : (
@@ -709,15 +734,15 @@ export default function Workspace() {
                 ref={textareaRef}
                 value={noteContent}
                 onChange={(e) => handleContentChange(e.target.value)}
-                placeholder="Type anything here... Supports Markdown formatting..."
+                placeholder="Type anything here... Keystrokes broadcast instantly across screens!"
                 className="w-full h-full bg-transparent resize-none focus:outline-none text-zinc-200 text-sm sm:text-base leading-relaxed placeholder-zinc-700 font-mono"
               />
             )}
           </div>
 
-          {/* Footer Metadata */}
-          <div className="px-4 py-2 border-t border-zinc-800/60 bg-zinc-950/60 flex items-center justify-between text-[11px] text-zinc-500 shrink-0">
-            <div className="flex items-center gap-2 sm:gap-3">
+          {/* Canvas Footer */}
+          <div className="px-4 py-1.5 border-t border-zinc-800/60 bg-zinc-950/60 flex items-center justify-between text-[11px] text-zinc-500 shrink-0">
+            <div className="flex items-center gap-2">
               <span>{wordCount} words</span>
               <span>•</span>
               <span>{charCount} chars</span>
@@ -725,15 +750,14 @@ export default function Workspace() {
           </div>
         </section>
 
-        {/* Right Section: Real-time Team Chat */}
+        {/* Right: Room Chat */}
         <section
           className={`
-            w-full lg:w-96 border-l border-zinc-800/80 flex flex-col bg-zinc-950/60 overflow-hidden
-            ${mobileTab === 'chat' ? 'flex' : 'hidden lg:flex'}
+            w-full lg:w-80 xl:w-96 border-l border-zinc-800/80 flex flex-col bg-zinc-950/60 overflow-hidden shrink-0
+            ${activeTab === 'chat' ? 'flex' : 'hidden lg:flex'}
           `}
         >
-          {/* Chat Header */}
-          <div className="px-4 py-2.5 border-b border-zinc-800/80 bg-zinc-900/40 flex items-center justify-between shrink-0">
+          <div className="px-3.5 py-2 sm:py-2.5 border-b border-zinc-800/80 bg-zinc-900/40 flex items-center justify-between shrink-0">
             <div className="flex items-center gap-2">
               <MessageSquare className="w-4 h-4 text-indigo-400" />
               <h2 className="font-medium text-xs sm:text-sm text-zinc-200">Room Chat</h2>
@@ -741,17 +765,17 @@ export default function Workspace() {
             <span className="text-[11px] text-zinc-500">{messages.length} messages</span>
           </div>
 
-          {/* Pinned Announcements Banner */}
+          {/* Pinned Announcements */}
           {pinnedMessages.length > 0 && (
-            <div className="bg-indigo-950/30 border-b border-indigo-900/50 p-2.5 space-y-1.5 shrink-0">
+            <div className="bg-indigo-950/30 border-b border-indigo-900/50 p-2 space-y-1 shrink-0">
               <div className="flex items-center gap-1.5 text-[11px] font-semibold text-indigo-300">
                 <Pin className="w-3 h-3 rotate-45" />
-                <span>Pinned Announcements ({pinnedMessages.length})</span>
+                <span>Pinned ({pinnedMessages.length})</span>
               </div>
-              <div className="max-h-24 overflow-y-auto space-y-1">
+              <div className="max-h-20 overflow-y-auto space-y-1">
                 {pinnedMessages.map((pin) => (
-                  <div key={pin.id} className="text-xs bg-zinc-900/70 border border-indigo-500/20 rounded-md p-1.5 text-zinc-200 flex items-start justify-between gap-2">
-                    <div>
+                  <div key={pin.id} className="text-xs bg-zinc-900/70 border border-indigo-500/20 rounded p-1 text-zinc-200 flex items-start justify-between gap-1">
+                    <div className="truncate">
                       <strong className="text-indigo-300 mr-1">{pin.sender_name}:</strong>
                       <span>{pin.message}</span>
                     </div>
@@ -759,7 +783,7 @@ export default function Workspace() {
                       type="button"
                       onClick={() => handleTogglePin(pin.id, true)}
                       title="Unpin"
-                      className="text-zinc-500 hover:text-zinc-300 shrink-0"
+                      className="text-zinc-500 hover:text-zinc-300 shrink-0 cursor-pointer"
                     >
                       <X className="w-3 h-3" />
                     </button>
@@ -769,11 +793,11 @@ export default function Workspace() {
             </div>
           )}
 
-          {/* Chat Messages Feed */}
-          <div className="flex-1 overflow-y-auto p-3 sm:p-4 space-y-3">
+          {/* Chat Message List */}
+          <div className="flex-1 overflow-y-auto p-3 space-y-2.5">
             {messages.length === 0 ? (
-              <div className="h-full flex flex-col items-center justify-center text-center text-zinc-600 space-y-2">
-                <MessageSquare className="w-8 h-8 opacity-30" />
+              <div className="h-full flex flex-col items-center justify-center text-center text-zinc-600 space-y-1.5">
+                <MessageSquare className="w-7 h-7 opacity-30" />
                 <p className="text-xs">No messages yet. Say hello!</p>
               </div>
             ) : (
@@ -784,14 +808,14 @@ export default function Workspace() {
 
                 return (
                   <div key={msg.id} className={`group relative flex flex-col ${isMe ? 'items-end' : 'items-start'}`}>
-                    <div className="flex items-center gap-1.5 mb-1 px-1">
+                    <div className="flex items-center gap-1 mb-0.5 px-1">
                       <span className="text-[10px] text-zinc-500 font-mono">{msg.sender_name}</span>
                       {isPinned && <Pin className="w-2.5 h-2.5 text-amber-400 rotate-45" />}
                     </div>
 
                     <div className="relative max-w-[85%]">
                       <div
-                        className={`rounded-2xl px-3.5 py-2 text-xs sm:text-sm leading-relaxed shadow-sm ${
+                        className={`rounded-2xl px-3 py-1.5 text-xs sm:text-sm leading-relaxed shadow-sm ${
                           isMe
                             ? 'bg-indigo-600 text-white rounded-br-xs'
                             : 'bg-zinc-900 border border-zinc-800 text-zinc-200 rounded-bl-xs'
@@ -800,7 +824,7 @@ export default function Workspace() {
                         {msg.message}
                       </div>
 
-                      {/* Hover / Tap Action Toolbar */}
+                      {/* Floating Actions on Hover / Touch */}
                       <div
                         className={`absolute -top-3 ${
                           isMe ? 'left-0 -translate-x-full pr-1.5' : 'right-0 translate-x-full pl-1.5'
@@ -809,7 +833,7 @@ export default function Workspace() {
                         <button
                           type="button"
                           onClick={() => setShowEmojiPickerFor(showEmojiPickerFor === msg.id ? null : msg.id)}
-                          className="p-1 hover:text-indigo-400 text-zinc-400 transition"
+                          className="p-1 hover:text-indigo-400 text-zinc-400 transition cursor-pointer"
                           title="React"
                         >
                           <Smile className="w-3 h-3" />
@@ -817,14 +841,23 @@ export default function Workspace() {
                         <button
                           type="button"
                           onClick={() => handleTogglePin(msg.id, !!isPinned)}
-                          className={`p-1 hover:text-amber-400 transition ${isPinned ? 'text-amber-400' : 'text-zinc-400'}`}
+                          className={`p-1 hover:text-amber-400 transition cursor-pointer ${isPinned ? 'text-amber-400' : 'text-zinc-400'}`}
                           title={isPinned ? 'Unpin message' : 'Pin message'}
                         >
                           <Pin className="w-3 h-3 rotate-45" />
                         </button>
+                        {isMe && (
+                          <button
+                            type="button"
+                            onClick={() => handleDeleteMessage(msg.id)}
+                            className="p-1 hover:text-rose-400 text-zinc-400 transition cursor-pointer"
+                            title="Delete message"
+                          >
+                            <Trash2 className="w-3 h-3" />
+                          </button>
+                        )}
                       </div>
 
-                      {/* Emoji Selector Popup */}
                       {showEmojiPickerFor === msg.id && (
                         <div className="absolute bottom-full mb-1 z-20 flex gap-1 bg-zinc-900 border border-zinc-700 p-1.5 rounded-full shadow-2xl">
                           {EMOJIS.map((emoji) => (
@@ -832,7 +865,7 @@ export default function Workspace() {
                               key={emoji}
                               type="button"
                               onClick={() => handleToggleReaction(msg.id, emoji)}
-                              className="hover:scale-125 transition text-sm p-1"
+                              className="hover:scale-125 transition text-sm p-1 cursor-pointer"
                             >
                               {emoji}
                             </button>
@@ -841,7 +874,6 @@ export default function Workspace() {
                       )}
                     </div>
 
-                    {/* Reactions Display */}
                     {Object.keys(reactions).length > 0 && (
                       <div className="flex flex-wrap gap-1 mt-1 px-1">
                         {Object.entries(reactions).map(([emoji, users]) => (
@@ -850,7 +882,7 @@ export default function Workspace() {
                             type="button"
                             onClick={() => handleToggleReaction(msg.id, emoji)}
                             title={users.join(', ')}
-                            className={`flex items-center gap-1 text-[11px] px-1.5 py-0.5 rounded-full border transition ${
+                            className={`flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded-full border transition cursor-pointer ${
                               users.includes(username)
                                 ? 'bg-indigo-600/30 border-indigo-500/40 text-indigo-200'
                                 : 'bg-zinc-900 border-zinc-800 text-zinc-400 hover:border-zinc-700'
@@ -867,9 +899,8 @@ export default function Workspace() {
               })
             )}
 
-            {/* Chat Typing Animation */}
             {chatTypingUsers.length > 0 && (
-              <div className="flex items-center gap-2 text-xs text-zinc-400 italic py-1 px-2">
+              <div className="flex items-center gap-1.5 text-xs text-zinc-400 italic py-0.5 px-1">
                 <div className="flex gap-1">
                   <div className="w-1.5 h-1.5 rounded-full bg-indigo-400 animate-bounce" />
                   <div className="w-1.5 h-1.5 rounded-full bg-indigo-400 animate-bounce [animation-delay:0.2s]" />
@@ -881,68 +912,25 @@ export default function Workspace() {
             <div ref={chatBottomRef} />
           </div>
 
-          {/* Chat Input */}
-          <form onSubmit={handleSendMessage} className="p-2.5 sm:p-3 border-t border-zinc-800/80 bg-zinc-900/30 flex gap-2 shrink-0">
+          {/* Chat Message Input Bar */}
+          <form onSubmit={handleSendMessage} className="p-2 sm:p-2.5 border-t border-zinc-800/80 bg-zinc-900/30 flex gap-1.5 shrink-0">
             <input
               type="text"
               value={newMessage}
               onChange={handleChatInputChange}
-              placeholder="Send message to room..."
-              className="flex-1 bg-zinc-900/90 border border-zinc-800 rounded-xl px-3 sm:px-4 py-2 text-xs sm:text-sm text-zinc-100 placeholder-zinc-600 focus:outline-none focus:ring-1 focus:ring-indigo-500/50 focus:border-indigo-500/80 transition"
+              placeholder="Send message..."
+              className="flex-1 bg-zinc-900/90 border border-zinc-800 rounded-lg px-3 py-1.5 text-xs sm:text-sm text-zinc-100 placeholder-zinc-600 focus:outline-none focus:ring-1 focus:ring-indigo-500/50 focus:border-indigo-500/80 transition"
             />
             <button
               type="submit"
               disabled={!newMessage.trim()}
-              className="p-2 sm:p-2.5 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 disabled:hover:bg-indigo-600 text-white rounded-xl transition cursor-pointer"
+              className="p-2 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 disabled:hover:bg-indigo-600 text-white rounded-lg transition cursor-pointer"
             >
-              <Send className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
+              <Send className="w-3.5 h-3.5" />
             </button>
           </form>
         </section>
       </div>
-
-      {/* Mobile Navigation Tab Bar (Phones & Small Tablets) */}
-      <nav className="lg:hidden flex items-center justify-around border-t border-zinc-800 bg-zinc-950/95 py-2 px-4 shrink-0 z-20">
-        <button
-          type="button"
-          onClick={() => {
-            setMobileTab('notes');
-            setIsSidebarOpen(false);
-          }}
-          className={`flex flex-col items-center gap-1 text-[11px] ${
-            mobileTab === 'notes' ? 'text-indigo-400 font-semibold' : 'text-zinc-500 hover:text-zinc-300'
-          }`}
-        >
-          <Edit3 className="w-4 h-4" />
-          <span>Notes</span>
-        </button>
-
-        <button
-          type="button"
-          onClick={() => {
-            setMobileTab('chat');
-            setIsSidebarOpen(false);
-          }}
-          className={`flex flex-col items-center gap-1 text-[11px] relative ${
-            mobileTab === 'chat' ? 'text-indigo-400 font-semibold' : 'text-zinc-500 hover:text-zinc-300'
-          }`}
-        >
-          <MessageSquare className="w-4 h-4" />
-          <span>Chat</span>
-          {pinnedMessages.length > 0 && (
-            <span className="absolute top-0 right-1 w-2 h-2 rounded-full bg-amber-400 ring-2 ring-zinc-950" />
-          )}
-        </button>
-
-        <button
-          type="button"
-          onClick={() => setIsSidebarOpen(true)}
-          className="flex flex-col items-center gap-1 text-[11px] text-zinc-500 hover:text-zinc-300"
-        >
-          <FileBox className="w-4 h-4" />
-          <span>Docs ({docs.length})</span>
-        </button>
-      </nav>
     </div>
   );
 }
